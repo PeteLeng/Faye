@@ -1,31 +1,56 @@
 # OpenAI HTTP and data model
 
-*Status: concrete v1 wire reference with one open decision: instructions.
-The examples below use the official public ChatGPT-plan and Responses API
-documentation. Observed traffic may verify the contract but does not replace
-it.*
+*Status: v1 wire reference (2026-10-08). Instructions and interrupted-response
+filtering remain open. The [foundation specification](spec-v1.md) owns Session
+history and Request lifecycle; this document maps them to the provider.*
 
-## 1. Official sources
+## Official sources
 
-There are official references for this flow. They divide into two layers:
-
-| Question | Official source |
+| Contract | Official reference |
 |---|---|
-| Which endpoint, token, model slug, and required flags? | [ChatGPT-plan models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference) |
-| Which request fields are forbidden for this plan flow? | [ChatGPT-plan preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) |
-| What JSON shapes may `input`, `output`, and a Response contain? | [Create a Response](https://developers.openai.com/api/reference/resources/responses/methods/create) |
-| What does each streaming event contain? | [Responses streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events) |
-| What do ChatGPT-plan failures look like? | [ChatGPT-plan errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery) |
-| Which HTTP headers carry request IDs and rate limits? | [API overview: debugging requests](https://developers.openai.com/api/reference/overview#debugging-requests) |
-| How is reasoning replayed with `store: false`? | [Reasoning: preserve reasoning without stored responses](https://developers.openai.com/api/docs/guides/reasoning#preserve-reasoning-without-stored-responses) |
+| ChatGPT-plan flow | [Overview](https://developers.openai.com/siwc/token-sharing-open-source) |
+| Registration, authorization, identity | [Sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in) |
+| Tokens and refresh | [Token reference](https://developers.openai.com/siwc/token-sharing-open-source/token-reference) |
+| Account models and inference | [Models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference) |
+| Plan-specific restrictions | [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) |
+| Request/Response schemas | [Create a Response](https://developers.openai.com/api/reference/resources/responses/methods/create) |
+| SSE schemas | [Streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events) |
+| Plan-specific errors | [Errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery) |
+| Request IDs and diagnostic headers | [API debugging](https://developers.openai.com/api/reference/overview#debugging-requests) |
+| Stateless reasoning | [Reasoning without stored responses](https://developers.openai.com/api/docs/guides/reasoning#preserve-reasoning-without-stored-responses) |
 
-OpenAI's generated SDK types are a useful machine-readable cross-check because
-they are generated from OpenAI's schema. They are not a substitute for the
-ChatGPT-plan restrictions.
+Generated SDK types cross-check the public schema; they do not supersede plan
+restrictions. Observed traffic verifies behavior, not a new provider contract.
 
-## 2. Model discovery
+## Provider setup
 
-### Request
+API requests use HTTPS at `https://api.openai.com/v1`.
+
+### Authentication
+
+On first login, dynamically register a client and persist its issued client ID
+and one stable, opaque installation `ext_agent_host_id`.
+
+| Setting | Value |
+|---|---|
+| Authorization endpoint | `https://auth.openai.com/api/accounts/authorize` |
+| Token endpoint | `https://auth.openai.com/api/accounts/oauth/token` |
+| Resource | `https://api.openai.com/v1` |
+| Loopback callback | Host `127.0.0.1`, path `/auth/callback` |
+| Scopes | `openid profile email offline_access resource.invoke chatgpt.tokens.use.direct` |
+
+Each authorization attempt uses a fresh PKCE verifier, `state`, and OIDC `nonce`.
+Validate callback state before code exchange. Validate the ID token's
+signature, issuer, audience, expiry, and nonce before accepting the account.
+Inference requires the granted `chatgpt.tokens.use.direct` scope.
+
+Persist the validated identity, access token, rotating refresh token, expiry,
+and granted scopes with the client/host IDs, separately from Session history.
+Operations acquire a usable token: reuse the cached token, refresh near expiry,
+and serialize refreshes for the active account so rotating refresh tokens
+cannot race.
+
+### Models
 
 ```http
 GET /v1/models HTTP/1.1
@@ -33,38 +58,22 @@ Host: api.openai.com
 Authorization: Bearer <ACCESS_TOKEN>
 ```
 
-There is no request body.
+No request body. Successful JSON has this shape, with additional fields allowed:
 
-### Successful response
-
-```http
-HTTP/1.1 200 OK
-Content-Type: application/json
-x-request-id: req_...
-
+```json
 {
   "models": [
-    {
-      "slug": "account-supported-model",
-      "display_name": "Account Supported Model",
-      "visibility": "list"
-    }
+    {"slug": "account-model", "display_name": "Account Model", "visibility": "list"}
   ]
 }
 ```
 
-The body may contain additional fields. Faye preserves server order, keeps
-entries whose `visibility` is `list`, displays `display_name`, and sends `slug`
-as the inference `model`.
+Preserve server order, include entries with `visibility == "list"`, display
+`display_name`, and send the selected `slug` as `model`.
 
-`x-request-id` is a documented common response header, not a guaranteed field
-of every response.
+## Inference request
 
-## 3. Inference request
-
-### Headers
-
-The official ChatGPT-plan example sends these two application headers:
+### HTTP
 
 ```http
 POST /v1/responses HTTP/1.1
@@ -73,158 +82,96 @@ Authorization: Bearer <ACCESS_TOKEN>
 Content-Type: application/json
 ```
 
-Faye may also send:
+Optional headers: `Accept: text/event-stream` and
+`X-Client-Request-Id: <Req_i.id>`. The latter must be unique ASCII of at most
+512 characters. `stream: true` selects SSE; `Accept` is descriptive.
 
-```http
-Accept: text/event-stream
-X-Client-Request-Id: <FAYE_REQUEST_ID>
-```
-
-`Accept` is descriptive but is not required by the official example;
-`stream: true` selects SSE. `X-Client-Request-Id` is officially supported and
-recommended for tracing when it is unique ASCII of at most 512 characters.
-
-HTTP libraries add transport headers such as `Host`, `Content-Length`, and
-`User-Agent`. Faye must not depend on their exact values.
-
-The official public flow does not document `ChatGPT-Account-Id` or `Originator`
-request headers. The new v1 contract does not depend on either header.
-
-### First request body
-
-While the instruction decision in section 8 remains open, the exact baseline
-body is:
-
-```json
-{
-  "model": "account-supported-model",
-  "input": [
-    {
-      "type": "message",
-      "role": "user",
-      "content": [
-        {
-          "type": "input_text",
-          "text": "Hello"
-        }
-      ]
-    }
-  ],
-  "store": false,
-  "stream": true
-}
-```
-
-The Responses API also accepts the shorter
-`{"role":"user","content":"Hello"}` form. Faye uses the expanded item form
-because it gives session history one stable provider-shaped representation.
-
-The current reasoning documentation says that when `store` is `false`,
-reasoning output contains `encrypted_content` by default. The legacy request
-field below is still accepted but is not required:
-
-```json
-{
-  "include": ["reasoning.encrypted_content"]
-}
-```
-
-Faye should preserve returned encrypted reasoning, not generate or inspect it.
-
-The ChatGPT-plan preview requires Faye to omit `previous_response_id` and send
-the required history in `input`. It also forbids fields including `background`,
-`conversation`, `metadata`, `prompt`, `temperature`, `top_p`, `truncation`, and
-`user`. The preview-limitation page is the authoritative full list.
-
-### Follow-up body
-
-For stateless continuation, Faye sends the earlier user item, every item from
-the successful response's `output` array in original order, and the new user
-item:
-
-```json
-{
-  "model": "account-supported-model",
-  "input": [
-    {
-      "type": "message",
-      "role": "user",
-      "content": [
-        {
-          "type": "input_text",
-          "text": "Hello"
-        }
-      ]
-    },
-    {
-      "id": "rs_123",
-      "type": "reasoning",
-      "summary": [],
-      "encrypted_content": "<OPAQUE_PROVIDER_VALUE>",
-      "status": "completed"
-    },
-    {
-      "id": "msg_123",
-      "type": "message",
-      "role": "assistant",
-      "status": "completed",
-      "phase": "final_answer",
-      "content": [
-        {
-          "type": "output_text",
-          "text": "Hi.",
-          "annotations": [],
-          "logprobs": []
-        }
-      ]
-    },
-    {
-      "type": "message",
-      "role": "user",
-      "content": [
-        {
-          "type": "input_text",
-          "text": "Continue."
-        }
-      ]
-    }
-  ],
-  "store": false,
-  "stream": true
-}
-```
-
-The reasoning item is opaque. The assistant `phase` field is optional, but when
-the provider returns it Faye must preserve and replay it. Faye must preserve all
-other output items and unknown fields as well; rendered assistant text alone is
-not sufficient conversation state.
-
-## 4. Successful inference response
-
-With `stream: true`, the response body is not one JSON document. It is an SSE
-stream whose `data` values are JSON event objects.
-
-### Headers
-
-A successful response has this semantic shape; the HTTP version and header
-order are not fixed:
-
-```http
-HTTP/1.1 200 OK
-Content-Type: text/event-stream
-x-request-id: req_...
-openai-processing-ms: ...
-openai-version: 2020-10-01
-```
-
-Only `Content-Type: text/event-stream` defines the body format. `x-request-id`,
-`openai-processing-ms`, `openai-version`, and rate-limit headers are documented
-common headers but may be absent. Faye records them when present and does not
-fail when they are absent.
+Transport libraries supply headers such as `Host`, `Content-Length`, and
+`User-Agent`; their exact values/order are not part of Faye's contract.
+The official plan flow does not document `ChatGPT-Account-Id` or `Originator`,
+and Faye does not depend on them or internal `backend-api` endpoints.
 
 ### Body
 
-An SSE record ends with a blank line. A text delta looks like:
+The baseline first request, pending the instruction decision:
+
+```json
+{
+  "model": "account-model",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "input_text", "text": "Hello"}]
+    }
+  ],
+  "store": false,
+  "stream": true
+}
+```
+
+The first input item illustrates `user_1`. Faye uses this expanded item shape
+rather than the also-supported `{"role":"user","content":"Hello"}` form.
+For every Request, `input = Req_i.items` as defined by the
+[history recurrence](spec-v1.md#request-construction); transport serializes the
+captured body without rebuilding it. Every inference body uses the selected
+model slug, `store: false`, and `stream: true`.
+
+Omit `previous_response_id`. Plan restrictions also forbid fields including
+`background`, `conversation`, `metadata`, `prompt`, `temperature`, `top_p`,
+`truncation`, and `user`; the preview-limitations page owns the full list.
+
+With `store: false`, current reasoning documentation says encrypted reasoning
+is returned by default. `include: ["reasoning.encrypted_content"]` remains
+accepted but is not required. Preserve returned opaque values without
+generating or inspecting their contents.
+
+## Response items and representation
+
+This literal output array illustrates one reasoning item and one assistant
+message. Subsequent schematic examples call it `output_items`:
+
+```json
+[
+  {
+    "id": "rs_123", "type": "reasoning", "status": "completed",
+    "summary": [], "encrypted_content": "<OPAQUE_PROVIDER_VALUE>"
+  },
+  {
+    "id": "msg_123", "type": "message", "role": "assistant",
+    "status": "completed", "phase": "final_answer",
+    "content": [
+      {"type": "output_text", "text": "Hi.", "annotations": [], "logprobs": []}
+    ]
+  }
+]
+```
+
+Retain unknown fields and passive output items. Preserve an assistant item's
+optional `phase` when returned. Rendering text/refusal content is a view;
+rendered strings cannot replace the retained provider items.
+
+| JSON | Lisp |
+|---|---|
+| object | Property list with keyword keys |
+| array | Vector |
+| string / number | String / integer or float |
+| `true` / `false` / `null` | `t` / `:false` / `nil` |
+
+Deep-copy captured bodies and response data before storing immutable Records.
+The [filter document](response-replay.md) owns interrupted-item eligibility;
+filtering must not modify retained data.
+
+## Streaming
+
+A successful streaming HTTP response uses `Content-Type: text/event-stream`.
+Record `x-request-id`, `openai-version`, `openai-processing-ms`, and rate-limit
+headers when present; their absence is not failure. HTTP version and header
+order are not fixed.
+
+An SSE record ends with a blank line. Accumulate arbitrary byte chunks across
+UTF-8 and SSE boundaries, handle LF/CRLF/CR line endings, and join multiple
+`data:` lines before decoding their JSON value. Example wire record:
 
 ```text
 event: response.output_text.delta
@@ -232,305 +179,154 @@ data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":1,
 
 ```
 
-On the wire, each event object is serialized on one `data:` line as above. The
-remaining examples pretty-print that JSON value for readability.
+Use JSON `type` as the event discriminator; the SSE `event` field may repeat it.
+Unknown event types/additional fields are allowed and must not by themselves
+cause failure.
 
-The completed reasoning item carries the reusable opaque value:
+| Event | Relevant payload | Effect |
+|---|---|---|
+| `response.output_item.added` | `output_index`, `item` | Introduce an item at its output position. |
+| `response.content_part.added/done` | `item_id`, `output_index`, `content_index`, `part` | Assemble/update the corresponding content part. |
+| `response.output_text.delta` / `response.refusal.delta` | Item/content indexes, `delta` | Accumulate content and notify presentation. |
+| `response.output_item.done` | `output_index`, `item` | Retain the finalized provider item at that position. |
+| `response.completed` | `response` | Validate completion; final `response.output` is authoritative. |
+| `response.failed` / `response.incomplete` | `response` | Retain provider envelope and fail the Request. |
+| `error` | `code`, `message`, `param` | Retain structured error and fail the Request. |
 
-```json
+Assembled items form `Resp_i.items`. Retain received items if interrupted even
+when no final envelope arrives; never invent a completed Response. A
+failed/incomplete envelope is retained alongside available accumulated data.
+
+These are schematic event objects, not literal JSON (`output_items` is the
+array above; ellipses omit other provider fields):
+
+```text
 {
-  "type": "response.output_item.done",
-  "output_index": 0,
-  "item": {
-    "id": "rs_123",
-    "type": "reasoning",
-    "summary": [],
-    "encrypted_content": "<OPAQUE_PROVIDER_VALUE>",
-    "status": "completed"
-  },
-  "sequence_number": 8
+  type: "response.output_item.done", output_index: 0,
+  item: output_items[0], sequence_number: 8
 }
-```
 
-The completed assistant item looks like:
-
-```json
 {
-  "type": "response.output_item.done",
-  "output_index": 1,
-  "item": {
-    "id": "msg_123",
-    "type": "message",
-    "role": "assistant",
-    "status": "completed",
-    "phase": "final_answer",
-    "content": [
-      {
-        "type": "output_text",
-        "text": "Hi.",
-        "annotations": [],
-        "logprobs": []
-      }
-    ]
-  },
-  "sequence_number": 9
-}
-```
-
-Success ends with `response.completed`. Its `response` member is the completed
-Response object, including the final ordered `output` array:
-
-```json
-{
-  "type": "response.completed",
-  "response": {
-    "id": "resp_123",
-    "object": "response",
-    "created_at": 1791331200,
-    "status": "completed",
-    "error": null,
-    "incomplete_details": null,
-    "instructions": null,
-    "model": "account-supported-model",
-    "output": [
-      {
-        "id": "rs_123",
-        "type": "reasoning",
-        "summary": [],
-        "encrypted_content": "<OPAQUE_PROVIDER_VALUE>",
-        "status": "completed"
-      },
-      {
-        "id": "msg_123",
-        "type": "message",
-        "role": "assistant",
-        "status": "completed",
-        "phase": "final_answer",
-        "content": [
-          {
-            "type": "output_text",
-            "text": "Hi.",
-            "annotations": [],
-            "logprobs": []
-          }
-        ]
-      }
-    ],
-    "parallel_tool_calls": true,
-    "tool_choice": "auto",
-    "tools": [],
-    "usage": {
-      "input_tokens": 10,
-      "input_tokens_details": {"cached_tokens": 0},
-      "output_tokens": 5,
-      "output_tokens_details": {"reasoning_tokens": 2},
-      "total_tokens": 15
-    }
-  },
-  "sequence_number": 10
-}
-```
-
-The public schema permits additional response fields and new event types.
-OpenAI explicitly treats those additions as backwards compatible. Faye checks
-the fields it needs and preserves the rest instead of requiring an exact key
-count.
-
-Faye uses the JSON `type` field as the event discriminator. The SSE `event`
-line may repeat the same value.
-
-`[DONE]` is not application success. Only a valid `response.completed` event
-can lead to request status `succeeded`.
-
-## 5. Failure responses
-
-### Failure before an SSE stream opens
-
-The ChatGPT-plan documentation explicitly warns that direct admission may
-return a non-standard JSON body:
-
-```http
-HTTP/1.1 503 Service Unavailable
-Content-Type: application/json
-x-request-id: req_...
-
-{"detail":"Direct routing is temporarily unavailable"}
-```
-
-Faye must not assume every non-2xx response uses the standard API error shape.
-
-A structured API error normally looks like:
-
-```json
-{
-  "error": {
-    "message": "Usage availability could not be checked.",
-    "type": "server_error",
-    "param": null,
-    "code": "subscription_sharing_usage_unavailable"
+  type: "response.completed", sequence_number: 10,
+  response: {
+    id: "resp_123", object: "response", status: "completed",
+    created_at: 1791331200, model: "account-model",
+    error: null, incomplete_details: null,
+    output: output_items,
+    usage: {
+      input_tokens: 10, input_tokens_details: {cached_tokens: 0},
+      output_tokens: 5, output_tokens_details: {reasoning_tokens: 2},
+      total_tokens: 15
+    }, ...
   }
 }
 ```
 
-Faye retains the HTTP status, content type, `x-request-id` when present, and the
-whole decoded JSON value. A human-readable message is derived for display but
-does not replace the structured data.
+### Completion validation
 
-### Failure after streaming begins
+Only a valid `response.completed` permits `Req_i.status = succeeded`:
 
-A Responses failure event contains a full Response object whose status is
-`failed` and whose `error` contains the provider code and message:
+- Its `response` is an object with a nonempty string `id`,
+  `status == "completed"`, and an `output` array of provider items.
+- A non-null provider `error` or `incomplete_details` contradicts completion.
+- Recognized items have the fields required by their provider input shapes.
+  Preserve unknown passive items/fields; do not require an exact key count.
+- Client-side tool actions are unsupported in v1 and produce a visible failure,
+  rather than being silently treated as completed assistant text.
+- Do not manufacture a missing status/output array from earlier SSE events or
+  treat `[DONE]`, HTTP 2xx, item-done, or EOF alone as completion.
 
-```json
-{
-  "type": "response.failed",
-  "response": {
-    "id": "resp_123",
-    "object": "response",
-    "created_at": 1791331200,
-    "status": "failed",
-    "error": {
-      "code": "subscription_sharing_usage_limit_exceeded",
-      "message": "Usage limit exceeded."
-    },
-    "incomplete_details": null,
-    "model": "account-supported-model",
-    "output": [],
-    "parallel_tool_calls": true,
-    "tool_choice": "auto",
-    "tools": []
-  },
-  "sequence_number": 4
-}
+Request success also requires the live assistant-Record update described in
+[the lifecycle](spec-v1.md#request-lifecycle). Terminal callback guards there
+apply to all later stream/process notifications.
+
+## Failures
+
+Non-2xx responses need not use a standard API error shape. For example:
+
+```http
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+x-request-id: req_example
+
+{"detail":"Direct routing is temporarily unavailable"}
 ```
 
-An incomplete response has the same outer event shape and records why it did
-not complete:
+A structured API error instead has fields such as:
 
 ```json
-{
-  "type": "response.incomplete",
-  "response": {
-    "id": "resp_123",
-    "object": "response",
-    "created_at": 1791331200,
-    "status": "incomplete",
-    "error": null,
-    "incomplete_details": {"reason": "max_output_tokens"},
-    "model": "account-supported-model",
-    "output": [],
-    "parallel_tool_calls": true,
-    "tool_choice": "auto",
-    "tools": []
-  },
-  "sequence_number": 4
-}
+{"error":{"message":"Usage availability could not be checked.","type":"server_error","param":null,"code":"subscription_sharing_usage_unavailable"}}
 ```
 
-An explicit stream error has this smaller schema:
+After streaming begins, the relevant shapes are schematic:
 
-```json
-{
-  "type": "error",
-  "code": "server_error",
-  "message": "The request failed.",
-  "param": null,
-  "sequence_number": 4
-}
+```text
+{type: "response.failed", response: {
+  ..., status: "failed", error: {code: "...", message: "..."}, output: [...]
+}, sequence_number: 4}
+
+{type: "response.incomplete", response: {
+  ..., status: "incomplete", incomplete_details: {reason: "max_output_tokens"},
+  output: [...]
+}, sequence_number: 4}
+
+{type: "error", code: "server_error", message: "...", param: null,
+ sequence_number: 4}
 ```
 
-`response.failed`, `response.incomplete`, `error`, malformed SSE, invalid JSON,
-and EOF without `response.completed` are all non-success outcomes.
+Retain HTTP status, content type, request ID when present, and the whole decoded
+error/envelope value. A display message is derived from this data, not a
+replacement for it. Error bodies remain inspection data, not log content.
 
-## 6. Faye representation
+`response.failed`, `response.incomplete`, `error`, non-2xx HTTP, malformed SSE,
+invalid JSON, and EOF without valid completion are non-success outcomes.
 
-Provider JSON is decoded as follows:
+## Logging and live verification
 
-| JSON | Lisp |
+Sanitize before data enters the log buffer. For a controlled first request and
+follow-up, the following metadata is sufficient to verify the wire contract:
+
+| Area | Permitted metadata |
 |---|---|
-| object | property list with keyword keys |
-| array | vector |
-| string | string |
-| number | integer or float |
-| `true` | `t` |
-| `false` | `:false` |
-| `null` | `nil` |
+| Request | Correlation ID, method, sanitized URL, header names, body byte count, field names, input item types/count. |
+| HTTP | Status, content type, request ID, version, processing time, rate-limit headers when present. |
+| SSE | Type, sequence number, indexes, item type, delta byte count, response status, provider error code. |
+| Final Response | Field names, item types, presence of `phase` and encrypted content, encrypted byte length. |
 
-The captured request body and successful response items are deep-copied before
-storage in runtime records. Unknown object fields and unknown passive output
-items are preserved. Items that request a client-side tool action are not
-silently treated as completed assistant text; tool loops are outside v1.
+Never log tokens, authorization headers, OAuth codes, callback query values or
+URLs, cookies, account IDs, email, prompt/response/refusal text, encrypted
+content values, or complete error bodies that may echo input. Do not use an
+unsanitized `curl --trace`. Header recording must use the allowlisted response
+metadata above.
 
-Faye renders `output_text` and refusal deltas for the response buffer. Rendering
-is a view. The complete provider items, not the rendered string, are replayed in
-the next request.
-
-## 7. Live verification and safe logging
-
-Live traffic can verify what the current service actually sends. It cannot turn
-an undocumented behavior into a stable contract.
-
-The current transport in `faye-openai.el` extracts the HTTP status and discards
-the parsed response headers. Before live verification, it must expose a
-sanitized header record to the request layer.
-
-For one controlled first request and one follow-up, record:
-
-- Request method, URL, header names, body byte count, top-level field names,
-  input item types, and input item count.
-- HTTP status, `Content-Type`, `x-request-id`, `openai-version`,
-  `openai-processing-ms`, and rate-limit headers when present.
-- For each SSE event: `type`, `sequence_number`, indexes, item type, delta byte
-  count, response status, and provider error code.
-- The field names and item types present in the final Response object.
-- Whether reasoning `encrypted_content` and assistant `phase` are present.
-
-Never record:
-
-- `Authorization`, access tokens, refresh tokens, ID tokens, OAuth codes, or
-  callback URLs.
-- Prompt text, response text, refusal text, cookies, account IDs, email, or
-  complete error bodies that may echo input.
-- `encrypted_content` values. Record only presence and byte length.
-
-Do not use an unsanitized `curl --trace`, because it records the Authorization
-header and full request and response bodies. Sanitization must happen before
-data enters the Faye log buffer.
-
-A useful sanitized event line is:
+Example:
 
 ```text
 SSE type=response.output_item.done seq=8 output-index=0 item=reasoning encrypted-content=yes encrypted-bytes=1840
 ```
 
-Live fixtures used in tests must replace request IDs, item IDs, model output,
-and opaque encrypted values with synthetic placeholders.
+Live fixtures must replace request/item IDs, model output, and opaque encrypted
+values with synthetic placeholders.
 
-## 8. Open decision: instructions
+## Open decision: instructions
 
-The baseline bodies above intentionally omit instructions.
-
-The ChatGPT-plan preview permits either the top-level `instructions` field or a
-developer message and rejects explicit system-message input items. Faye still
-needs to choose among:
+Baseline bodies omit instructions pending a product decision. The plan permits
+top-level `instructions` or a developer message, and rejects explicit system
+input messages. Options:
 
 1. Prompt-only v1.
-2. One top-level `instructions` value captured with each request.
-3. A developer message represented in replayable `input` history.
+2. Top-level `instructions`, captured with each Request as configuration.
+3. A developer message retained in input history.
 
-The decision depends on the desired session semantics: whether an instruction
-is request configuration or conversation history, and what should happen when
-it changes during an existing session. No instruction behavior is normative
-until that product decision is made and `spec-v1.md` is updated.
+Choose whether instructions are configuration or history and how changes
+affect an existing Session before making any behavior normative.
 
-## 9. Schema cross-checks
+## Schema cross-checks
 
-- [Generated `Response` type](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response.py)
-- [Generated output message type](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_output_message.py)
-- [Generated reasoning item type](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_reasoning_item.py)
-- [Generated text-delta event type](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_text_delta_event.py)
-- [Generated output-item-done event type](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_output_item_done_event.py)
-- [Generated completed event type](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_completed_event.py)
-- [Generated failed event type](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_failed_event.py)
-- [Generated incomplete event type](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_incomplete_event.py)
-- [Generated error event type](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_error_event.py)
+- [Response](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response.py)
+- [Output message](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_output_message.py)
+- [Reasoning item](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_reasoning_item.py)
+- [Text delta](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_text_delta_event.py)
+- [Item done](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_output_item_done_event.py)
+- [Completed](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_completed_event.py), [failed](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_failed_event.py), [incomplete](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_incomplete_event.py), [error](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_error_event.py)
+- Input schemas relevant to interrupted replay are referenced in [response-replay.md](response-replay.md#provider-evidence).
