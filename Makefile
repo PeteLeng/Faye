@@ -1,6 +1,6 @@
 EMACS ?= emacs
 
-FILES = faye-log.el faye-req.el
+FILES = faye-log.el faye-req.el faye-curl.el
 TESTS = $(wildcard test/*-test.el)
 
 .PHONY: test compile check clean
