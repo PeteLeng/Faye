@@ -1,6 +1,6 @@
 EMACS ?= emacs
 
-FILES = faye.el faye-session.el faye-openai.el faye-view.el faye-context.el faye-output.el
+FILES = faye-log.el faye-req.el
 TESTS = $(wildcard test/*-test.el)
 
 .PHONY: test compile check clean
