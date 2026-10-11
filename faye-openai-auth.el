@@ -3,10 +3,10 @@
 ;;; Commentary:
 
 ;; API surface for the documented ChatGPT-plan registration and sign-in flow.
-;; Request construction/execution, credential I/O and cryptographic helpers
-;; are implemented.  Sign-in orchestration and its callback listener are stubs.
-;; Composition and policy belong in sign-in, including host-ID reuse/creation,
-;; generation of each authorization value, and decisions to fetch signing keys.
+;; Sign-in composes browser authorization, code exchange, ID-token validation,
+;; and credential storage.  Request and cryptographic helpers run asynchronously.
+;; Inspect value snapshots with `faye-log-show'; the result callback receives
+;; the saved credentials, including :access_token, on success.
 ;;
 ;; Credential record: JSON object, represented in Lisp as a keyword plist.
 ;; Fields match the documented local-file schema:
@@ -14,11 +14,11 @@
 ;;   access_token, refresh_token, token_type, expires_in, scopes, saved_at.
 ;; scopes is a vector of granted scope strings.  saved_at is a UTC timestamp
 ;; captured when the token response arrives, before validation or file writing.
-;; The first-run record format before credentials exist is still an open decision.
+;; Before the first successful sign-in, a generated host ID stays in memory.
 ;; There is one provider-specific credentials file, not a separate host-ID file.
 ;;
 ;; ext_agent_host_id identifies an app-defined host, such as an installation
-;; or VM.  It is stable across restarts and sign-ins, distinct for each host,
+;; or VM.  Once saved it is stable across restarts and sign-ins, distinct per host,
 ;; and is not an authentication credential.  An issued client_id identifies
 ;; the user's OAuth registration; that registration can be used on several hosts.
 ;; A UUIDv4 URI (urn:uuid:...) is a supported host-ID format.
@@ -50,6 +50,8 @@
 (require 'url-util)
 (require 'json)
 (require 'cl-lib)
+(require 'browse-url)
+(require 'faye-log)
 (require 'faye-req)
 (require 'faye-curl)
 
@@ -94,23 +96,38 @@
   "OpenAI request templates keyed by documented operation.
 Each entry supplies fixed HTTP fields and fixed/required/optional parameters.
 Encoding is query for URL parameters, form for body parameters, or nil.
-Registration versus reauthorization choices belong in sign-in.")
+Registration versus reauthorization choices belong in authorization.")
 
 (defvar faye-openai-auth-credentials-file
   (expand-file-name "faye/openai/credentials.json" user-emacs-directory)
   "Default path for the OpenAI credential record.")
 
+(defvar faye-openai-auth-sign-in-timeout 300
+  "Seconds to wait for the browser callback during sign-in.")
+
+(defvar faye-openai-auth--host-id nil
+  "In-memory fallback host ID, saved with credentials after successful sign-in.")
+
+(defvar faye-openai-auth--sign-in-active-p nil
+  "Non-nil while a sign-in owns the active account's credential update.")
+
 (defun faye-openai-auth--failure (kind message &optional data)
   "Construct a failed result with KIND, MESSAGE and inspection DATA."
   (list :status 'failed :error (list :kind kind :message message :data data)))
 
+(defun faye-openai-auth--log (&rest values)
+  "Log explicitly selected VALUES without affecting execution.
+Callers supply diagnostic fields, never raw tokens, callback URLs or identity."
+  (ignore-errors (faye-log-debug "AUTH" (format "%S" values))))
+
 ;; Credential storage.
 
 (defun faye-openai-auth-load-credentials (&optional file)
-  "Read the credential record from FILE as a JSON-compatible plist.
-FILE defaults to `faye-openai-auth-credentials-file'.  Return nil if absent;
-signal an error for unreadable or malformed data.  Loading a record does not
-establish that its access token is still usable."
+  "Read and validate the credential record from FILE as a keyword plist.
+FILE defaults to `faye-openai-auth-credentials-file'.  Return nil for a missing
+file, empty or whitespace-only contents, or an empty JSON object.  Signal an
+error for unreadable data or a nonempty record with invalid or missing fields.
+Check the stored structure, not token freshness: expired tokens still load."
   (let ((file-path (or file faye-openai-auth-credentials-file)))
     (when (file-exists-p file-path)
       (with-temp-buffer
@@ -118,15 +135,39 @@ establish that its access token is still usable."
           (insert-file-contents file-path))
         (goto-char (point-min))
         (skip-chars-forward " \t\r\n")
-        (unless (eq (char-after) ?{)
-          (error "Credential record must be a JSON object"))
-        (let ((credentials (json-parse-buffer
-                            :object-type 'plist :array-type 'array
-                            :null-object nil :false-object :false)))
-          (skip-chars-forward " \t\r\n")
-          (unless (eobp)
-            (error "Unexpected content after credential record"))
-          credentials)))))
+        (unless (eobp)
+          (unless (eq (char-after) ?{)
+            (error "Credential record must be a JSON object"))
+          (let ((credentials (json-parse-buffer
+                              :object-type 'plist :array-type 'array
+                              :null-object nil :false-object :false)))
+            (skip-chars-forward " \t\r\n")
+            (unless (eobp)
+              (error "Unexpected content after credential record"))
+            (when credentials
+              (dolist (field '(:client_id :ext_agent_host_id :issuer :subject
+                                          :id_token :access_token :refresh_token
+                                          :token_type :saved_at))
+                (let ((value (plist-get credentials field)))
+                  (unless (and (stringp value) (> (length value) 0))
+                    (error "Missing or invalid saved credential field: %s" field))))
+              (when (equal (plist-get credentials :client_id) "dynamic_agent_client")
+                (error "Saved client ID must be an issued registration"))
+              (unless (equal (downcase (plist-get credentials :token_type)) "bearer")
+                (error "Saved token type must be Bearer"))
+              (unless (or (null (plist-get credentials :email))
+                          (stringp (plist-get credentials :email)))
+                (error "Saved email must be a string or null"))
+              (unless (and (numberp (plist-get credentials :expires_in))
+                           (> (plist-get credentials :expires_in) 0))
+                (error "Saved expires_in must be a positive number"))
+              (let ((scopes (plist-get credentials :scopes)))
+                (unless (and (vectorp scopes)
+                             (cl-every (lambda (scope)
+                                         (and (stringp scope) (> (length scope) 0)))
+                                       scopes))
+                  (error "Saved scopes must be an array of nonempty strings"))))
+            credentials))))))
 
 (defun faye-openai-auth-save-credentials (credentials &optional file)
   "Atomically write CREDENTIALS to FILE and return CREDENTIALS on success.
@@ -160,24 +201,509 @@ This method composes the documented steps: load saved data, prepare the host
 and fresh authorization values, start the listener, open the authorization
 URL, validate the callback, exchange the code, verify the ID token and granted
 permissions, and save credentials.  ON-RESULT receives saved credentials as
-its success value.  Release the listener on completion or failure.
-The initial host-ID persistence format remains to be decided."
-  (ignore on-result credentials-file)
-  (error "faye-openai-auth-sign-in is not implemented yet"))
+its success value, including :access_token.  Inspect progress with
+`faye-log-show'.  Only one sign-in may run at a time.
+
+Reuse the saved host ID, or generate an in-memory fallback and persist it only
+with successful credentials.  A restart before that save may change the ID.
+Callbacks run after this function returns.  The browser wait is bounded by
+`faye-openai-auth-sign-in-timeout'.  Release the listener on completion or
+failure."
+  (unless (functionp on-result)
+    (error "ON-RESULT must be a function"))
+  (let ((credentials-file (expand-file-name
+                           (or credentials-file faye-openai-auth-credentials-file)))
+        (done-p nil)
+        (owns-sign-in-lock-p nil)
+        saved-credentials auth-result)
+    (cl-labels
+        ((finish (result)
+           (unless done-p
+             (setq done-p t)
+             ;; A busy rejection must not release another sign-in's lock.
+             (when owns-sign-in-lock-p
+               (setq faye-openai-auth--sign-in-active-p nil))
+             (faye-openai-auth--log
+              :operation 'sign-in :status (plist-get result :status)
+              :error-kind (plist-get (plist-get result :error) :kind)
+              :message (plist-get (plist-get result :error) :message))
+             (ignore-errors (funcall on-result result))))
+
+         (start ()
+           (condition-case error-data
+               (if faye-openai-auth--sign-in-active-p
+                   (finish (faye-openai-auth--failure 'busy "Sign-in is already running"))
+                 (setq owns-sign-in-lock-p t faye-openai-auth--sign-in-active-p t)
+                 (setq saved-credentials
+                       (faye-openai-auth-load-credentials credentials-file))
+                 (faye-openai-auth--authorize saved-credentials #'exchange-code))
+             ((error quit)
+              (finish (faye-openai-auth--failure
+                       'preparation "Could not prepare sign-in" error-data)))))
+
+         (exchange-code (result)
+           (if (eq (plist-get result :status) 'succeeded)
+               (condition-case error-data
+                   (progn
+                     (setq auth-result (plist-get result :value))
+                     (faye-openai-auth-send-request
+                      (faye-openai-auth-build-request
+                       'exchange-code
+                       `(("client_id" . ,(plist-get auth-result :client-id))
+                         ("code" . ,(plist-get auth-result :code))
+                         ("code_verifier" . ,(plist-get auth-result :code-verifier))
+                         ("redirect_uri" . ,(plist-get auth-result :redirect-uri))))
+                      #'verify-tokens))
+                 ((error quit)
+                  (finish (faye-openai-auth--failure
+                           'exchange "Could not exchange authorization code" error-data))))
+             (finish result)))
+
+         (verify-tokens (result)
+           (if (eq (plist-get result :status) 'succeeded)
+               (condition-case error-data
+                   (let ((token-result (plist-get result :value)))
+                     (faye-openai-auth--verify-token-response
+                      (plist-get token-result :response)
+                      (plist-get token-result :received-at)
+                      auth-result saved-credentials
+                      (lambda (verification-result)
+                        (if (eq (plist-get verification-result :status) 'succeeded)
+                            (condition-case error-data
+                                (let ((credentials (plist-get verification-result :value)))
+                                  (faye-openai-auth-save-credentials credentials credentials-file)
+                                  (faye-openai-auth--log
+                                   :operation 'save-credentials
+                                   :saved-at (plist-get credentials :saved_at))
+                                  (finish verification-result))
+                              ((error quit)
+                               (finish (faye-openai-auth--failure
+                                        'storage "Could not save credentials" error-data))))
+                          (finish verification-result)))))
+                 ((error quit)
+                  (finish (faye-openai-auth--failure
+                           'token "Invalid token response" error-data))))
+             (finish result))))
+      (run-at-time 0 nil #'start)))
+  nil)
+
+(defun faye-openai-auth--authorize (saved-credentials on-result)
+  "Authorize in the browser using SAVED-CREDENTIALS, or register when nil.
+Own authorization values, the listener and its timeout.  ON-RESULT receives
+an async result whose success value contains :code, :client-id, :host-id,
+:code-verifier, :redirect-uri and :nonce for exchange and token verification.
+Close the listener before delivering the result."
+  (let* ((client-registration-needed-p (null saved-credentials))
+         (client-id (if client-registration-needed-p "dynamic_agent_client"
+                      (plist-get saved-credentials :client_id)))
+         (host-id (or (plist-get saved-credentials :ext_agent_host_id)
+                      faye-openai-auth--host-id))
+         (done-p nil)
+         listener browser-timer state nonce code-verifier redirect-uri)
+    (cl-labels
+        ((finish (result)
+           (unless done-p
+             (setq done-p t)
+             (unwind-protect
+                 (progn
+                   (when browser-timer (cancel-timer browser-timer))
+                   (faye-openai-auth--stop-callback-listener listener))
+               (ignore-errors (funcall on-result result)))))
+
+         (accept-code (parameters)
+           ;; Browser callbacks and the timeout compete for one completion.
+           (unless done-p
+             (condition-case error-data
+                 (progn
+                   (dolist (name '("code" "state" "client_id" "error" "error_description" "scope"))
+                     (when (> (cl-count name parameters :key #'car :test #'equal) 1)
+                       (error "Duplicate callback parameter: %s" name)))
+                   (let ((code (cdr (assoc "code" parameters)))
+                         (returned-client-id (cdr (assoc "client_id" parameters)))
+                         (oauth-error (assoc "error" parameters))
+                         (state-match-p (equal (cdr (assoc "state" parameters)) state)))
+                     (faye-openai-auth--log
+                      :operation 'authorize :state-match-p state-match-p
+                      :code-present-p (and code t) :oauth-error-p (and oauth-error t)
+                      :client-id-present-p (and returned-client-id t)
+                      :client-id-match-p (equal returned-client-id client-id))
+                     (unless state-match-p (error "Callback state does not match"))
+                     (if oauth-error
+                         (finish (faye-openai-auth--failure
+                                  'oauth "Authorization was not granted" parameters))
+                       (unless (and (stringp code) (> (length code) 0))
+                         (error "Missing authorization code"))
+                       (if client-registration-needed-p
+                           (unless (and (stringp returned-client-id)
+                                        (> (length returned-client-id) 0)
+                                        (not (equal returned-client-id "dynamic_agent_client")))
+                             (error "Registration did not return an issued client ID"))
+                         (when (and returned-client-id (not (equal returned-client-id client-id)))
+                           (error "Callback client ID does not match")))
+                       (finish
+                        (list :status 'succeeded
+                              :value (list :code code :client-id (or returned-client-id client-id)
+                                           :host-id host-id :code-verifier code-verifier
+                                           :redirect-uri redirect-uri :nonce nonce))))))
+               ((error quit)
+                (finish (faye-openai-auth--failure
+                         'callback "Invalid authorization callback" error-data))))))
+
+         (start ()
+           (condition-case error-data
+               (progn
+                 (faye-openai-auth--log
+                  :operation 'authorize :client-registration-needed-p client-registration-needed-p
+                  :host-id-source
+                  (cond ((plist-get saved-credentials :ext_agent_host_id) 'credentials)
+                        (host-id 'memory) (t 'generated)))
+                 ;; Independent slices: state, nonce, verifier, then UUID material.
+                 (faye-openai-auth--random-bytes
+                  112
+                  (lambda (result)
+                    (if (eq (plist-get result :status) 'succeeded)
+                        (condition-case error-data
+                            (let ((bytes (plist-get result :value)))
+                              (setq state (base64url-encode-string (substring bytes 0 32) t)
+                                    nonce (base64url-encode-string (substring bytes 32 64) t)
+                                    code-verifier (base64url-encode-string
+                                                   (substring bytes 64 96) t))
+                              (unless host-id
+                                (setq host-id (faye-openai-auth--uuid-v4 (substring bytes 96 112))
+                                      faye-openai-auth--host-id host-id))
+                              (setq listener
+                                    (faye-openai-auth--start-callback-listener #'accept-code)
+                                    redirect-uri (format "http://127.0.0.1:%d/auth/callback"
+                                                         (process-contact listener :service)))
+                              (let ((parameters
+                                     `(("client_id" . ,client-id) ("ext_agent_host_id" . ,host-id)
+                                       ("redirect_uri" . ,redirect-uri)
+                                       ("state" . ,state) ("nonce" . ,nonce)
+                                       ("code_challenge"
+                                        . ,(base64url-encode-string
+                                            (secure-hash 'sha256 code-verifier nil nil t) t)))))
+                                (if client-registration-needed-p
+                                    (push '("agent_name_hint" . "Faye") parameters)
+                                  (when (plist-get saved-credentials :id_token)
+                                    (push (cons "id_token_hint"
+                                                (plist-get saved-credentials :id_token))
+                                          parameters))
+                                  (when (plist-get saved-credentials :email)
+                                    (push (cons "login_hint" (plist-get saved-credentials :email))
+                                          parameters)))
+                                (setq browser-timer
+                                      (run-at-time
+                                       faye-openai-auth-sign-in-timeout nil
+                                       (lambda ()
+                                         (finish
+                                          (faye-openai-auth--failure
+                                           'timeout
+                                           "Timed out waiting for authorization callback")))))
+                                (faye-openai-auth--log
+                                 :operation 'authorize :redirect-uri redirect-uri
+                                 :state-length (length state) :nonce-length (length nonce)
+                                 :verifier-length (length code-verifier))
+                                (browse-url
+                                 (plist-get
+                                  (faye-openai-auth-build-request 'authorize parameters)
+                                  :url))))
+                          ((error quit)
+                           (finish (faye-openai-auth--failure
+                                    'authorization "Could not start browser authorization"
+                                    error-data))))
+                      (finish result)))))
+             ((error quit)
+              (finish (faye-openai-auth--failure
+                       'authorization "Could not prepare authorization" error-data))))))
+      (run-at-time 0 nil #'start)))
+  nil)
+
+(defun faye-openai-auth--verify-token-response
+    (token-response received-at auth-result saved-credentials on-result)
+  "Verify TOKEN-RESPONSE and deliver a credential plist through ON-RESULT.
+RECEIVED-AT is the token receipt timestamp.  AUTH-RESULT is the successful
+authorization value containing the client ID, host ID and nonce.
+SAVED-CREDENTIALS supplies the expected identity for a returning sign-in.
+This async wrapper validates token fields, verifies the ID token and builds
+the credential record.  Its caller owns saving the record.  All callbacks,
+including validation failures, run after this function returns."
+  (run-at-time
+   0 nil
+   (lambda ()
+     (condition-case error-data
+         (let ((scopes (faye-openai-auth--validate-token-response token-response)))
+           (faye-openai-auth--verify-id-token
+            (plist-get token-response :id_token)
+            (plist-get auth-result :client-id)
+            (plist-get auth-result :nonce)
+            saved-credentials
+            (lambda (result)
+              (when (eq (plist-get result :status) 'succeeded)
+                (setq result
+                      (condition-case error-data
+                          (let* ((claims (plist-get result :value))
+                                 (credentials
+                                  (list :email (plist-get claims :email)
+                                        :issuer (plist-get claims :iss)
+                                        :subject (plist-get claims :sub)
+                                        :client_id (plist-get auth-result :client-id)
+                                        :ext_agent_host_id (plist-get auth-result :host-id)
+                                        :id_token (plist-get token-response :id_token)
+                                        :access_token (plist-get token-response :access_token)
+                                        :refresh_token (plist-get token-response :refresh_token)
+                                        :token_type (plist-get token-response :token_type)
+                                        :expires_in (plist-get token-response :expires_in)
+                                        :scopes scopes :saved_at received-at)))
+                            (list :status 'succeeded :value credentials))
+                        ((error quit)
+                         (faye-openai-auth--failure
+                          'credentials "Could not build credential record" error-data)))))
+              (ignore-errors (funcall on-result result)))))
+       ((error quit)
+        (ignore-errors
+          (funcall on-result
+                   (faye-openai-auth--failure
+                    'token "Invalid token response" error-data)))))))
+  nil)
+
+(defun faye-openai-auth--validate-token-response (token-response)
+  "Validate TOKEN-RESPONSE fields and plan permission; return a scopes vector."
+  (dolist (field '(:access_token :refresh_token :id_token :token_type :scope))
+    (let ((value (plist-get token-response field)))
+      (unless (and (stringp value) (> (length value) 0))
+        (error "Missing or invalid token field: %s" field))))
+  (let ((scopes (split-string (plist-get token-response :scope) " +" t)))
+    (faye-openai-auth--log
+     :operation 'validate-token-response :token-type (plist-get token-response :token_type)
+     :expires-in (plist-get token-response :expires_in) :scopes scopes
+     :access-token-bytes (string-bytes (plist-get token-response :access_token))
+     :refresh-token-present-p t :id-token-present-p t)
+    (unless (and (equal (downcase (plist-get token-response :token_type)) "bearer")
+                 (numberp (plist-get token-response :expires_in))
+                 (> (plist-get token-response :expires_in) 0)
+                 (member "chatgpt.tokens.use.direct" scopes))
+      (error "Invalid token type, expiry or granted plan scope"))
+    (vconcat scopes)))
+
+(defun faye-openai-auth--verify-id-token
+    (id-token client-id nonce saved-credentials on-result)
+  "Verify ID-TOKEN for CLIENT-ID and NONCE, reporting through ON-RESULT.
+Fetch trusted JWKS, verify the RS256 signature, and validate claims.  When
+SAVED-CREDENTIALS is non-nil, require its identity to match.  The async success
+value is the verified claims object."
+  (let (header claims signing-input signature)
+    (cl-labels
+        ((finish (result)
+           (ignore-errors (funcall on-result result)))
+
+         (start ()
+           (condition-case error-data
+               (let ((parts (split-string id-token "\\.")))
+                 (unless (= (length parts) 3)
+                   (error "Expected a three-part ID token"))
+                 (setq header (faye-openai-auth--decode-jwt-object (car parts)))
+                 (unless (and (equal (plist-get header :alg) "RS256")
+                              (stringp (plist-get header :kid))
+                              (> (length (plist-get header :kid)) 0)
+                              (not (plist-member header :crit))
+                              (not (plist-member header :b64)))
+                   (error "Expected an RS256 ID token with a key ID"))
+                 (setq claims (faye-openai-auth--decode-jwt-object (nth 1 parts))
+                       signing-input (encode-coding-string
+                                      (concat (car parts) "." (nth 1 parts)) 'us-ascii)
+                       signature (base64-decode-string (nth 2 parts) t))
+                 (faye-openai-auth-send-request
+                  (faye-openai-auth-build-request 'jwks nil) #'verify-signature))
+             ((error quit)
+              (finish (faye-openai-auth--failure
+                       'id-token "Could not decode ID token" error-data)))))
+
+         (verify-signature (result)
+           (if (eq (plist-get result :status) 'succeeded)
+               (condition-case error-data
+                   (let ((public-key
+                          (faye-openai-auth--select-signing-key
+                           (plist-get (plist-get result :value) :response)
+                           (plist-get header :kid))))
+                     (faye-openai-auth--verify-rs256-signature
+                      public-key signing-input signature
+                      (lambda (verification-result)
+                        (if (eq (plist-get verification-result :status) 'succeeded)
+                            (condition-case error-data
+                                (finish
+                                 (list :status 'succeeded
+                                       :value (faye-openai-auth--validate-id-token-claims
+                                               claims client-id nonce saved-credentials)))
+                              ((error quit)
+                               (finish (faye-openai-auth--failure
+                                        'id-token "Invalid ID-token claims" error-data))))
+                          (finish verification-result)))))
+                 ((error quit)
+                  (finish (faye-openai-auth--failure
+                           'jwks "Could not select or use signing key" error-data))))
+             (finish result))))
+      (run-at-time 0 nil #'start)))
+  nil)
+
+(defun faye-openai-auth--select-signing-key (jwks key-id)
+  "Return the unique RS256 signing key for KEY-ID in JWKS, or signal an error."
+  (let* ((keys (plist-get jwks :keys))
+         (matches (and (vectorp keys)
+                       (cl-remove-if-not
+                        (lambda (key) (equal (plist-get key :kid) key-id))
+                        (append keys nil))))
+         (key (car matches)))
+    (faye-openai-auth--log
+     :operation 'select-signing-key :kid key-id :matching-key-count (length matches))
+    (unless (and (= (length matches) 1)
+                 (equal (plist-get key :kty) "RSA")
+                 (or (not (plist-member key :alg)) (equal (plist-get key :alg) "RS256"))
+                 (or (not (plist-member key :use)) (equal (plist-get key :use) "sig"))
+                 (or (not (plist-member key :key_ops))
+                     (and (vectorp (plist-get key :key_ops))
+                          (member "verify" (append (plist-get key :key_ops) nil)))))
+      (error "No unique compatible signing key"))
+    key))
+
+(defun faye-openai-auth--validate-id-token-claims (claims client-id nonce saved-credentials)
+  "Validate signed CLAIMS against CLIENT-ID, NONCE and SAVED-CREDENTIALS.
+Return CLAIMS on success; signal an error if any required check fails."
+  (let* ((issuer (plist-get claims :iss))
+         (subject (plist-get claims :sub))
+         (audience (plist-get claims :aud))
+         (audiences (if (stringp audience) (list audience)
+                      (and (vectorp audience) (append audience nil))))
+         (azp (plist-get claims :azp))
+         (expiry (plist-get claims :exp))
+         (not-before (plist-get claims :nbf))
+         (now (float-time))
+         (issuer-match-p (equal issuer "https://auth.openai.com"))
+         (audience-match-p (and audiences (cl-every #'stringp audiences)
+                                (member client-id audiences) t))
+         (nonce-match-p (equal (plist-get claims :nonce) nonce))
+         (identity-match-p (or (null saved-credentials)
+                               (and (equal issuer (plist-get saved-credentials :issuer))
+                                    (equal subject (plist-get saved-credentials :subject))))))
+    (faye-openai-auth--log
+     :operation 'validate-id-token-claims :signature-valid-p t
+     :issuer-match-p issuer-match-p :audience-match-p audience-match-p
+     :nonce-match-p nonce-match-p :identity-match-p identity-match-p
+     :exp expiry :nbf not-before :now now)
+    (unless (and issuer-match-p audience-match-p nonce-match-p identity-match-p
+                 (stringp subject) (> (length subject) 0)
+                 (numberp expiry) (> expiry now)
+                 (or (not (plist-member claims :nbf))
+                     (and (numberp not-before) (<= not-before now)))
+                 (if (or (plist-member claims :azp) (> (length audiences) 1))
+                     (equal azp client-id)
+                   t))
+      (error "ID-token claims do not match this authorization"))
+    claims))
+
+(defun faye-openai-auth--uuid-v4 (bytes)
+  "Format sixteen random BYTES as a UUIDv4 URI."
+  (let ((octets (copy-sequence bytes)))
+    (aset octets 6 (logior #x40 (logand (aref octets 6) #x0f)))
+    (aset octets 8 (logior #x80 (logand (aref octets 8) #x3f)))
+    (let ((hex (mapconcat (lambda (byte) (format "%02x" byte)) octets "")))
+      (format "urn:uuid:%s-%s-%s-%s-%s"
+              (substring hex 0 8) (substring hex 8 12) (substring hex 12 16)
+              (substring hex 16 20) (substring hex 20 32)))))
+
+(defun faye-openai-auth--decode-jwt-object (segment)
+  "Decode a base64url JWT SEGMENT as a JSON object, without trusting it."
+  (unless (and (stringp segment) (string-match-p "\\`[A-Za-z0-9_-]+\\'" segment))
+    (error "Invalid JWT segment encoding"))
+  (let ((bytes (base64-decode-string segment t)))
+    (unless (string-match-p "\\`[ \t\r\n]*{" bytes)
+      (error "JWT header and claims must be JSON objects"))
+    (json-parse-string bytes :object-type 'plist :array-type 'array
+                       :null-object nil :false-object :false)))
 
 (defun faye-openai-auth--start-callback-listener (on-callback)
   "Start a loopback listener on 127.0.0.1 and return its process object.
 Choose an available port, obtainable with `process-contact'.  Accept the
 documented /auth/callback path.  ON-CALLBACK receives decoded query parameters
 as an alist of string pairs; preserve duplicate entries for caller validation.
-Sign-in owns callback state/client-ID checks and listener lifetime."
-  (ignore on-callback)
-  (error "faye-openai-auth--start-callback-listener is not implemented yet"))
+Authorization owns callback state/client-ID checks and listener lifetime."
+  (let (server)
+    (cl-labels
+        ((reply (connection status text)
+           (set-process-filter connection #'ignore)
+           (process-send-string
+            connection
+            (concat "HTTP/1.1 " status "\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                    "Connection: close\r\nCache-Control: no-store\r\n"
+                    "Content-Length: " (number-to-string (string-bytes text)) "\r\n\r\n" text))
+           (process-send-eof connection))
+
+         (decode-value (value)
+           ;; Replace + before percent decoding, so %2B stays a literal plus.
+           (when (string-match-p
+                  "%\\(?:[^0-9A-Fa-f]\\|[0-9A-Fa-f][^0-9A-Fa-f]\\|[0-9A-Fa-f]?\\'\\)"
+                  value)
+             (error "Invalid query escape"))
+           (decode-coding-string
+            (url-unhex-string (replace-regexp-in-string "+" " " value t t)) 'utf-8-unix))
+
+         (receive (connection chunk)
+           (condition-case nil
+               (let* ((bytes (concat (process-get connection 'faye-auth-request) chunk))
+                      (end (string-match "\r\n\r\n" bytes)))
+                 (process-put connection 'faye-auth-request bytes)
+                 (cond
+                  ((> (length bytes) 16384)
+                   (reply connection "431 Request Header Fields Too Large" "Request too large."))
+                  (end
+                   (unless (string-match "\\`GET \\([^ \r\n]+\\) HTTP/1\\.[01]\r\n" bytes)
+                     (error "Expected an HTTP GET request"))
+                   (let* ((target (match-string 1 bytes))
+                          (query-start (string-match "?" target))
+                          (path (if query-start (substring target 0 query-start) target)))
+                     (if (not (equal path "/auth/callback"))
+                         (reply connection "404 Not Found" "Not found.")
+                       (let ((parameters
+                              (mapcar
+                               (lambda (field)
+                                 (let ((equals (string-match "=" field)))
+                                   (cons (decode-value
+                                          (if equals (substring field 0 equals) field))
+                                         (decode-value
+                                          (if equals (substring field (1+ equals)) "")))))
+                               (split-string
+                                (if query-start (substring target (1+ query-start)) "")
+                                "&" t))))
+                         (reply connection "200 OK" "Callback received; return to Emacs.")
+                         (process-put connection 'faye-auth-request nil)
+                         (funcall on-callback parameters)))))))
+             (error
+              (when (process-live-p connection)
+                (ignore-errors (reply connection "400 Bad Request" "Invalid request.")))))))
+      (setq server
+            (make-network-process
+             :name "faye-auth-callback" :server t :family 'ipv4
+             :host "127.0.0.1" :service t :coding 'binary :noquery t
+             :filter #'receive
+             :sentinel (lambda (connection _message)
+                         (unless (process-live-p connection)
+                           (process-put server 'faye-auth-connections
+                                        (delq connection
+                                              (process-get server 'faye-auth-connections)))
+                           (process-put connection 'faye-auth-request nil)))
+             :log (lambda (_server connection _message)
+                    (process-put server 'faye-auth-connections
+                                 (cons connection (process-get server 'faye-auth-connections)))))))
+    server))
 
 (defun faye-openai-auth--stop-callback-listener (listener-process)
   "Close LISTENER-PROCESS and its accepted connections, idempotently."
-  (ignore listener-process)
-  (error "faye-openai-auth--stop-callback-listener is not implemented yet"))
+  (when listener-process
+    (dolist (process (cons listener-process (process-get listener-process 'faye-auth-connections)))
+      (set-process-filter process #'ignore)
+      (set-process-sentinel process #'ignore)
+      (process-put process 'faye-auth-request nil)
+      (ignore-errors (delete-process process)))
+    (process-put listener-process 'faye-auth-connections nil)))
 
 ;; Shared request construction and execution.
 
@@ -251,7 +777,7 @@ Authorization URLs are opened in the browser instead of sent by this helper."
           (lambda (payload _emit-event emit-result)
             ;; Each attempt gets its own accumulator; responses never mingle.
             (let (body-chunks)
-              (condition-case start-error
+              (condition-case error-data
                   (faye-curl-start
                    payload
                    (lambda (event)
@@ -267,6 +793,9 @@ Authorization URLs are opened in the browser instead of sent by this helper."
                                   body-bytes :object-type 'plist :array-type 'array
                                   :null-object nil :false-object :false))
                          (error (setq decode-error error-data)))
+                       (faye-openai-auth--log
+                        :transport transport-result :body-bytes (length body-bytes)
+                        :json-error (car decode-error))
                        (funcall
                         emit-result
                         (cond
@@ -288,14 +817,14 @@ Authorization URLs are opened in the browser instead of sent by this helper."
                  (funcall emit-result
                           (faye-openai-auth--failure
                            'transport "Could not start OpenAI HTTP request"
-                           start-error)))))))))
+                           error-data)))))))))
     ;; OAuth retry classification is a separate policy; use one attempt for now.
     (faye-req-start request nil
                     (lambda (_request result)
                       (ignore-errors (funcall on-result result))))))
 
 ;; Atomic cryptographic operations.
-;; Sign-in composes these; caching decisions and claim checks stay in sign-in.
+;; Authorization and ID-token verification compose these operations.
 
 (defun faye-openai-auth--run-openssl (arguments input-bytes on-result)
   "Run OpenSSL with ARGUMENTS asynchronously, sending INPUT-BYTES when non-nil.
@@ -342,7 +871,7 @@ This helper owns both process objects; its caller owns any argument files."
            (unless done-p (push bytes stderr-chunks)))
 
          (start ()
-           (condition-case start-error
+           (condition-case error-data
                (progn
                  (setq stderr-pipe-process
                        (make-pipe-process
@@ -363,7 +892,7 @@ This helper owns both process objects; its caller owns any argument files."
                  (when input-bytes
                    (process-send-string openssl-process input-bytes)
                    (process-send-eof openssl-process)))
-             (error (finish nil start-error)))))
+             (error (finish nil error-data)))))
       (run-at-time 0 nil #'start)))
   nil)
 
@@ -377,11 +906,10 @@ code_verifier or host-ID material."
   (faye-openai-auth--run-openssl
    (list "rand" (number-to-string byte-count)) nil
    (lambda (result)
-     (if (and (eq (plist-get result :status) 'succeeded)
-              (/= (length (plist-get result :value)) byte-count))
-         (funcall on-result
-                  (faye-openai-auth--failure 'crypto "Unexpected random byte count"))
-       (funcall on-result result)))))
+     (when (eq (plist-get result :status) 'succeeded)
+       (unless (= (length (plist-get result :value)) byte-count)
+         (setq result (faye-openai-auth--failure 'crypto "Unexpected random byte count"))))
+     (funcall on-result result))))
 
 (defun faye-openai-auth--der-value (tag contents)
   "Encode a DER value with TAG and unibyte CONTENTS."
@@ -455,7 +983,7 @@ The caller checks the ID token's algorithm and claims separately."
                       (dolist (file (list key-file signature-file))
                         (when file (delete-file file)))
                     (ignore-errors (funcall on-result result))))))
-           (condition-case preparation-error
+           (condition-case error-data
                (let ((key-bytes (faye-openai-auth--rsa-public-key-der public-key)))
                  (setq key-file (make-temp-file "faye-auth-public-key-"))
                  (setq signature-file (make-temp-file "faye-auth-signature-"))
@@ -473,7 +1001,7 @@ The caller checks the ID token's algorithm and claims separately."
              (error
               (finish (faye-openai-auth--failure
                        'crypto "Could not prepare signature verification"
-                       preparation-error)))))))))
+                       error-data)))))))))
   nil)
 
 (provide 'faye-openai-auth)
